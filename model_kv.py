@@ -4,8 +4,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import time
 
 model_config: dict = {
-    "n_layers": 28, 
-    "vocab_size": 151936, 
+    "n_layers": 28,
+    "vocab_size": 151936,
     "embedding_dim": 1024,
     "epsilon": 1e-6,
     "head_dim": 128,
@@ -14,21 +14,36 @@ model_config: dict = {
     "context_length": 40960,
     "n_groups": 8,
     "dtype": torch.bfloat16,
-    "theta_base": 1000000
+    "theta_base": 1000000,
 }
-
 
 
 class MLP(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.up_proj = torch.nn.Linear(config["embedding_dim"], config["intermediate_size"], dtype=config["dtype"], bias=False)
-        self.down_proj = torch.nn.Linear(config["intermediate_size"], config["embedding_dim"], dtype=config["dtype"], bias=False)
-        self.gate_proj = torch.nn.Linear(config["embedding_dim"], config["intermediate_size"], dtype=config["dtype"], bias=False)
-    
-    def forward(self, x: torch.Tensor):
-        return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+        self.up_proj = torch.nn.Linear(
+            config["embedding_dim"],
+            config["intermediate_size"],
+            dtype=config["dtype"],
+            bias=False,
+        )
+        self.down_proj = torch.nn.Linear(
+            config["intermediate_size"],
+            config["embedding_dim"],
+            dtype=config["dtype"],
+            bias=False,
+        )
+        self.gate_proj = torch.nn.Linear(
+            config["embedding_dim"],
+            config["intermediate_size"],
+            dtype=config["dtype"],
+            bias=False,
+        )
 
+    def forward(self, x: torch.Tensor):
+        return self.down_proj(
+            torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x)
+        )
 
 
 class GQA(torch.nn.Module):
@@ -41,21 +56,56 @@ class GQA(torch.nn.Module):
         self.head_dim = config["head_dim"]
         self.dtype = config["dtype"]
 
-        self.k_proj = torch.nn.Linear(self.embedding_dim, self.head_dim * self.n_groups, bias=False, dtype=self.dtype)
-        self.v_proj = torch.nn.Linear(self.embedding_dim, self.head_dim * self.n_groups, bias=False, dtype=self.dtype)
-        self.q_proj = torch.nn.Linear(self.embedding_dim, self.n_heads * self.head_dim, bias=False, dtype=self.dtype)
-        self.o_proj = torch.nn.Linear(self.n_heads * self.head_dim, self.embedding_dim, bias=False, dtype=self.dtype)
-        self.q_norm = RMSNorm(self.head_dim, dtype=self.dtype, epsilon=config["epsilon"])
-        self.k_norm = RMSNorm(self.head_dim, dtype=self.dtype, epsilon=config["epsilon"])
+        self.k_proj = torch.nn.Linear(
+            self.embedding_dim,
+            self.head_dim * self.n_groups,
+            bias=False,
+            dtype=self.dtype,
+        )
+        self.v_proj = torch.nn.Linear(
+            self.embedding_dim,
+            self.head_dim * self.n_groups,
+            bias=False,
+            dtype=self.dtype,
+        )
+        self.q_proj = torch.nn.Linear(
+            self.embedding_dim,
+            self.n_heads * self.head_dim,
+            bias=False,
+            dtype=self.dtype,
+        )
+        self.o_proj = torch.nn.Linear(
+            self.n_heads * self.head_dim,
+            self.embedding_dim,
+            bias=False,
+            dtype=self.dtype,
+        )
+        self.q_norm = RMSNorm(
+            self.head_dim, dtype=self.dtype, epsilon=config["epsilon"]
+        )
+        self.k_norm = RMSNorm(
+            self.head_dim, dtype=self.dtype, epsilon=config["epsilon"]
+        )
         self.prefix_length = 0
-    
 
-    def forward(self, x: torch.Tensor, mask, cos, sin, position, layer_id, kv_cache, use_kv_cache=True):
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask,
+        cos,
+        sin,
+        position,
+        layer_id,
+        kv_cache,
+        use_kv_cache=True,
+    ):
         b, t, c = x.shape
 
-        k = self.k_proj(x) # (b, t, self.n_groups * self.head_dim)
-        q = self.q_proj(x) # (b, t, self.n_heads <-> self.group_size * self.n_groups * self.head_dim)
-        v = self.v_proj(x) # (b, t, self.n_groups * self.head_dim)
+        k = self.k_proj(x)  # (b, t, self.n_groups * self.head_dim)
+        q = self.q_proj(
+            x
+        )  # (b, t, self.n_heads <-> self.group_size * self.n_groups * self.head_dim)
+        v = self.v_proj(x)  # (b, t, self.n_groups * self.head_dim)
 
         k = k.view(b, t, self.n_groups, self.head_dim).transpose(1, 2)
         q = q.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
@@ -64,7 +114,7 @@ class GQA(torch.nn.Module):
         # normalizing keys and queries
         k = self.k_norm(k)
         q = self.q_norm(q)
-        
+
         # apply rope
         k = apply_rope(k, cos, sin, self.prefix_length + position)
         q = apply_rope(q, cos, sin, self.prefix_length + position)
@@ -76,27 +126,31 @@ class GQA(torch.nn.Module):
                 self.prefix_length = t
             else:
                 # Dodam trenutno izracunate k i v vrednosti
-                kv_cache["keys"][layer_id] = torch.cat([kv_cache["keys"][layer_id], k], dim=2)
-                kv_cache["values"][layer_id] = torch.cat([kv_cache["values"][layer_id], v], dim=2)
+                kv_cache["keys"][layer_id] = torch.cat(
+                    [kv_cache["keys"][layer_id], k], dim=2
+                )
+                kv_cache["values"][layer_id] = torch.cat(
+                    [kv_cache["values"][layer_id], v], dim=2
+                )
                 # setujem k i v vrednosti na ovo sto je kesu
                 k = kv_cache["keys"][layer_id]
                 v = kv_cache["values"][layer_id]
 
-
         # Expanding keys and values
-        k = k.repeat_interleave(self.group_size, dim=1) # In dimension 1 repeat the current state self.group_size times so we can perform everything that we need to
+        k = k.repeat_interleave(
+            self.group_size, dim=1
+        )  # In dimension 1 repeat the current state self.group_size times so we can perform everything that we need to
         v = v.repeat_interleave(self.group_size, dim=1)
 
-        att_scores = q @ k.transpose(2, 3) # att_scores = (b, n_heads, t, t)
-        att_masked = torch.masked_fill(att_scores, mask, float('-inf'))
+        att_scores = q @ k.transpose(2, 3)  # att_scores = (b, n_heads, t, t)
+        att_masked = torch.masked_fill(att_scores, mask, float("-inf"))
         att_norm = torch.nn.functional.softmax(att_masked / self.head_dim**0.5, dim=-1)
 
-        y = att_norm @ v # y = (b, n_heads, t, head_dim)
+        y = att_norm @ v  # y = (b, n_heads, t, head_dim)
         y = y.transpose(1, 2).contiguous().view(b, t, self.n_heads * self.head_dim)
         y = self.o_proj(y)
-        
-        return y
 
+        return y
 
 
 class RMSNorm(torch.nn.Module):
@@ -108,7 +162,9 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x: torch.Tensor):
         x = x.to(dtype=torch.float32)
-        rrms = 1 / torch.sqrt(torch.mean(torch.pow(x, 2), dim=-1, keepdim=True) + self.epsilon)
+        rrms = 1 / torch.sqrt(
+            torch.mean(torch.pow(x, 2), dim=-1, keepdim=True) + self.epsilon
+        )
         x_norm = x * rrms
         return x_norm.to(self.dtype) * self.weight
 
@@ -116,13 +172,19 @@ class RMSNorm(torch.nn.Module):
 class TransformerBlock(torch.nn.Module):
     def __init__(self, config: dict):
         super().__init__()
-        self.input_layernorm = RMSNorm(config["embedding_dim"], dtype=config["dtype"], epsilon=config["epsilon"])
+        self.input_layernorm = RMSNorm(
+            config["embedding_dim"], dtype=config["dtype"], epsilon=config["epsilon"]
+        )
         self.self_attn = GQA(config)
-        self.post_attention_layernorm = RMSNorm(config["embedding_dim"], dtype=config["dtype"], epsilon=config["epsilon"])
+        self.post_attention_layernorm = RMSNorm(
+            config["embedding_dim"], dtype=config["dtype"], epsilon=config["epsilon"]
+        )
         self.mlp = MLP(config)
 
     def forward(self, x: torch.Tensor, mask, cos, sin, position, idx, kv_cache):
-        x = x + self.self_attn(self.input_layernorm(x), mask, cos, sin, position, idx, kv_cache)
+        x = x + self.self_attn(
+            self.input_layernorm(x), mask, cos, sin, position, idx, kv_cache
+        )
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -131,13 +193,15 @@ def compute_rope(config) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     This function will generate cos and sine value tables (rank 2 tensors) that will be used in GQA
     """
-    theta = config["theta_base"] ** (torch.arange(0, config["head_dim"], 2).float() / config["head_dim"])  # rotation frequency, based on the RoPE paper I will compute  d/2 of these 
-    inv_freq = 1 / theta # (head_dim // 2,)
-    positions = torch.arange(config["context_length"]) # (context_length,)
-    inv_freq = inv_freq.unsqueeze(0) # (1, head_dim // 2)
-    positions = positions.unsqueeze(1) # (context_lenght, 1)
-    angles = positions * inv_freq # (context_length, head_dim // 2)
-    angles = torch.cat([angles, angles], dim=1) # [[1, 2, 1, 2], [3, 4, 3, 4]]
+    theta = config["theta_base"] ** (
+        torch.arange(0, config["head_dim"], 2).float() / config["head_dim"]
+    )  # rotation frequency, based on the RoPE paper I will compute  d/2 of these
+    inv_freq = 1 / theta  # (head_dim // 2,)
+    positions = torch.arange(config["context_length"])  # (context_length,)
+    inv_freq = inv_freq.unsqueeze(0)  # (1, head_dim // 2)
+    positions = positions.unsqueeze(1)  # (context_lenght, 1)
+    angles = positions * inv_freq  # (context_length, head_dim // 2)
+    angles = torch.cat([angles, angles], dim=1)  # [[1, 2, 1, 2], [3, 4, 3, 4]]
     cos = torch.cos(angles)
     sin = torch.sin(angles)
     return cos, sin
@@ -147,14 +211,16 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, position):
     b, n_head, t, head_dim = x.shape
 
     # Splitting x into two halves
-    x1 = x[..., :head_dim // 2]
-    x2 = x[..., head_dim // 2:]
+    x1 = x[..., : head_dim // 2]
+    x2 = x[..., head_dim // 2 :]
 
-    cos = cos[position:position + t, :].unsqueeze(0).unsqueeze(0) # Shape: (1, 1, t, head_dim)
-    sin = sin[position:position + t, :].unsqueeze(0).unsqueeze(0)
+    cos = (
+        cos[position : position + t, :].unsqueeze(0).unsqueeze(0)
+    )  # Shape: (1, 1, t, head_dim)
+    sin = sin[position : position + t, :].unsqueeze(0).unsqueeze(0)
 
     rotated = torch.cat([-x2, x1], dim=-1)
-    x_rotated = (x * cos) + (rotated * sin) # (b, n_head, t, head_dim)
+    x_rotated = (x * cos) + (rotated * sin)  # (b, n_head, t, head_dim)
 
     return x_rotated.to(dtype=x.dtype)
 
@@ -163,13 +229,21 @@ class Qwen3(torch.nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.embed_tokens = torch.nn.Embedding(config["vocab_size"], config["embedding_dim"], dtype=config["dtype"])
-        self.layers = torch.nn.ModuleList([TransformerBlock(config) for i in range(config["n_layers"])])
-        self.norm = RMSNorm(config["embedding_dim"], config["dtype"], epsilon=config["epsilon"])
+        self.embed_tokens = torch.nn.Embedding(
+            config["vocab_size"], config["embedding_dim"], dtype=config["dtype"]
+        )
+        self.layers = torch.nn.ModuleList(
+            [TransformerBlock(config) for i in range(config["n_layers"])]
+        )
+        self.norm = RMSNorm(
+            config["embedding_dim"], config["dtype"], epsilon=config["epsilon"]
+        )
         # Tied embeddings
-        self.lm_head = torch.nn.Linear(config["embedding_dim"], config["vocab_size"], bias=False)
+        self.lm_head = torch.nn.Linear(
+            config["embedding_dim"], config["vocab_size"], bias=False
+        )
         self.lm_head.weight = self.embed_tokens.weight
-        
+
         cos, sin = compute_rope(config)
 
         self.register_buffer("cos", cos, persistent=False)
@@ -179,17 +253,21 @@ class Qwen3(torch.nn.Module):
     def forward(self, x: torch.Tensor, position, kv_cache):
         b, t = x.shape
         if position == 0:
-            mask = torch.triu(torch.ones(t, t, device=x.device, dtype=torch.bool), diagonal=1)
+            mask = torch.triu(
+                torch.ones(t, t, device=x.device, dtype=torch.bool), diagonal=1
+            )
             self.prefix_length = t
         else:
-            mask = torch.zeros(1, position + self.prefix_length, device=x.device, dtype=bool) # Just one row of length - current sequence length (prefix + current token position)
+            mask = torch.zeros(
+                1, position + self.prefix_length, device=x.device, dtype=bool
+            )  # Just one row of length - current sequence length (prefix + current token position)
 
         x = self.embed_tokens(x)
         for idx, layer in enumerate(self.layers):
             x = layer(x, mask, self.cos, self.sin, position, idx, kv_cache)
         x = self.norm(x)
         x = self.lm_head(x)
-        return x # These are logits at the moment
+        return x  # These are logits at the moment
 
     @classmethod
     def from_pretrained(cls, model_type: str):
@@ -198,78 +276,91 @@ class Qwen3(torch.nn.Module):
         config = model_config
 
         model = Qwen3(config)
-        
+
         sd = model.state_dict()
         sd_keys = sd.keys()
-    
+
         # init a huggingface/transformers model
         model_hf = AutoModelForCausalLM.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
         sd_keys_hf = sd_hf.keys()
-  
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+
+        assert len(sd_keys_hf) == len(
+            sd_keys
+        ), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         sd_hf = {k.removeprefix("model."): v for k, v in model_hf.state_dict().items()}
         sd_hf.pop("lm_head.weight", None)
         for k, v in sd_hf.items():
             assert sd[k].shape == v.shape, f"{k}: {sd[k].shape} != {v.shape}"
             with torch.no_grad():
                 sd[k].copy_(v)
-        
 
         return model
-    
-def generate_text_basic_stream_kv_cache(model, token_ids, max_new_tokens, eos_token_id=None, kv_cache=True):
+
+
+def generate_text_basic_stream_kv_cache(
+    model, token_ids, max_new_tokens, eos_token_id=None, kv_cache=True
+):
     model.eval()
-    kv_cache = {"keys": [[] for _ in range(model_config['n_layers'])], "values":[[] for _ in range(model_config['n_layers'])]}
+    kv_cache = {
+        "keys": [[] for _ in range(model_config["n_layers"])],
+        "values": [[] for _ in range(model_config["n_layers"])],
+    }
     position = 0
     with torch.no_grad():
         for _ in range(max_new_tokens):
             out = model(token_ids, position, kv_cache)[:, -1]
             next_token = torch.argmax(out, dim=-1, keepdim=True)
 
-            if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
-               calculate_kv_cache_size(kv_cache)
-               break
+            if eos_token_id is not None and torch.all(next_token == eos_token_id):
+                calculate_kv_cache_size(kv_cache)
+                break
 
             yield next_token
-            
+
             position += 1
             token_ids = next_token
-            
 
-def calculate_kv_cache_size(cache:dict):
+
+def calculate_kv_cache_size(cache: dict):
     total_elements = 0
     for key in cache.keys():
         for layer in cache[key]:
             total_elements += layer.numel()
-            
+
     print(f"\nTotal BF16 numbers in KV cache: {total_elements}")
     print(f"\nTotal size of KV cache in MB: {total_elements * 16 / (8 * 1024 * 1024)}")
+
 
 if __name__ == "__main__":
     model = Qwen3.from_pretrained("Qwen/Qwen3-0.6B")
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
-    ids = torch.tensor([tokenizer.encode("<|im_start|>user\nGive me a short introduction to large language models.<|im_end|>\n<|im_start|>assistant\n")])
-    
+    ids = torch.tensor(
+        [
+            tokenizer.encode(
+                "<|im_start|>user\nGive me a short introduction to large language models.<|im_end|>\n<|im_start|>assistant\n"
+            )
+        ]
+    )
+
     generated_tokens = 0
     start = time.time()
     for token in generate_text_basic_stream_kv_cache(
         model=model,
         token_ids=ids,
         max_new_tokens=500,
-        eos_token_id=tokenizer.eos_token_id
+        eos_token_id=tokenizer.eos_token_id,
     ):
         generated_tokens += 1
         token_id = token.squeeze(0).tolist()
         print(
             tokenizer.decode(token_id),
             end="",
-            flush=True # So the print does not buffer anything but immedietly prints to console
+            flush=True,  # So the print does not buffer anything but immedietly prints to console
         )
     end = time.time()
     print(f"Total execution time: {end - start}")
     print(generated_tokens)
-    
